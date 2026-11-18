@@ -1,0 +1,7 @@
+{
+  "name": "DriftFog.Runtime",
+  "rootNamespace": "DriftFog",
+  "references": [],
+  "includePlatforms": [],
+  "autoReferenced": true
+}

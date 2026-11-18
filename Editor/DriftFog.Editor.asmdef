@@ -1,0 +1,11 @@
+{
+  "name": "DriftFog.Editor",
+  "rootNamespace": "DriftFog",
+  "references": [
+    "DriftFog.Runtime"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "autoReferenced": true
+}

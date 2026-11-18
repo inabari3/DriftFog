@@ -1,0 +1,873 @@
+#pragma kernel RasterizeSolids
+#pragma kernel Initialize
+#pragma kernel ClearPressure
+#pragma kernel Curl
+#pragma kernel PredictVelocity
+#pragma kernel AdvectVelocity
+#pragma kernel DiffuseVelocity
+#pragma kernel Divergence
+#pragma kernel Jacobi
+#pragma kernel RestrictPressure
+#pragma kernel SolveCoarse
+#pragma kernel ProlongatePressure
+#pragma kernel Project
+#pragma kernel TransportDisplacement
+#pragma kernel PredictDensity
+#pragma kernel CorrectDensity
+
+// 各セルの正側の三面に速度を置く MAC 格子。密度・圧力・固体マスクはセル中心。
+// 位置は体積の最小隅を原点とするメートル、速度は同じ直交座標系での m/s。
+int3 _GridSize;
+float3 _CellSize;
+float _Dt;
+float _SimTime;
+float3 _Wind;
+float2 _InflowHeading;
+float _Turbulence;
+float _HeightFalloff;
+float _NoiseFrequency;
+float _Recovery;
+float _Vorticity;
+int _ActorCount;
+float4 _ActorPosRadius[12];
+float4 _ActorVelocityStrength[12];
+float4 _ActorShedding[12]; // xy: 半径で正規化した後縁の芯、z: 符号付き放出強度、w: 解像度による寄与率
+int _BoxCount;
+float4x4 _BoxFromDomain[8];
+int _WakeCount;
+float4 _WakeCenters[8]; // xyz: 剥離位置、w: 作用半径の逆数
+float4 _WakeAxes[8];    // xyz: 渦軸、w: 半径で正規化した半長
+float4 _WakeBounds[8];  // xyz: 支持域の AABB 半径、w: 符号付き加速度
+groupshared uint WakeMask;
+
+Texture3D<float> _NoiseTex;
+SamplerState sampler_NoiseTex;
+SamplerState sampler_LinearClamp;
+Texture3D<float> _SolidRead;
+RWTexture3D<float> _SolidWrite;
+Texture3D<float4> _VelocityRead;
+RWTexture3D<float4> _VelocityWrite;
+Texture3D<float4> _DisplacementRead;
+RWTexture3D<float4> _DisplacementWrite;
+int _DisplacementHasHistory;
+int _HighAdvection;
+float3 _DiffusionWeights;
+Texture3D<float4> _VelocityPrediction;
+Texture3D<float4> _CurlRead;
+RWTexture3D<float4> _CurlWrite;
+Texture3D<float> _DensityRead;
+Texture3D<float> _PredictedRead;
+RWTexture3D<float> _DensityWrite;
+Texture3D<float> _DivergenceRead;
+RWTexture3D<float> _DivergenceWrite;
+Texture3D<float> _PressureRead;
+RWTexture3D<float> _PressureWrite;
+Texture3D<float4> _CoarseStencilRead;
+RWTexture3D<float4> _CoarseStencilWrite;
+Texture3D<float> _CoarsePressureRead;
+RWTexture3D<float> _CoarsePressureWrite;
+
+bool Inside(int3 i)
+{
+    return all(i >= 0) && all(i < _GridSize);
+}
+
+bool Solid(int3 i)
+{
+    // 範囲外のロードを避ける。底面と外部境界の条件は面フラックス側で扱う。
+    if (!Inside(i) || _BoxCount == 0)
+        return false;
+    return _SolidRead.Load(int4(i, 0)) > 0.5;
+}
+
+float3 Center(int3 i)
+{
+    return (float3(i) + 0.5) * _CellSize;
+}
+
+float3 UV(float3 p)
+{
+    return p / (float3(_GridSize) * _CellSize);
+}
+
+float3 OpenFaces(int3 i)
+{
+    return float3(!Solid(i + int3(1, 0, 0)), !Solid(i + int3(0, 1, 0)), !Solid(i + int3(0, 0, 1)));
+}
+
+float RibbonPhase(float3 q)
+{
+    float2 stream = float2(dot(q.xz, _InflowHeading), dot(q.xz, float2(-_InflowHeading.y, _InflowHeading.x)));
+    return 40.0 * stream.y + 2.35 * sin(12.0 * stream.x + 3.0 * stream.y) +
+           1.1 * sin(5.3 * stream.x - 7.8 * stream.y + 1.6) + 2.4 * q.y;
+}
+
+float IncomingRibbon(float3 p, float time)
+{
+    float3 q = (p - _Wind * time) * _NoiseFrequency;
+    q.y *= 1.4;
+    return 0.5 + 0.5 * cos(RibbonPhase(q));
+}
+
+// 外から入る側の密度には風速で移流する霧の塊を連続的に供給する。
+float IncomingDensity(float3 p)
+{
+    float3 q = (p - _Wind * _SimTime) * _NoiseFrequency;
+    q.y *= 1.4;
+    float broad = _NoiseTex.SampleLevel(sampler_NoiseTex, q + float3(0.13, 0.33, 0.27), 0);
+    float3 fineUV = q.zxy * 2.17 + float3(0.37, 0.51, 0.73);
+    fineUV += _Turbulence * (broad - 0.5) * float3(0.6, -0.43, 0.31);
+    float fine = _NoiseTex.SampleLevel(sampler_NoiseTex, fineUV, 0);
+    float cloud = broad + (fine - 0.5) * (0.28 + 0.4 * _Turbulence);
+    // 上から見ても追える厚みのある曲線を流入する空気に含める。高さ方向の位相差を小さくし、
+    // 視線積分で濃淡が消えないようにする。供給後は密度の実値として局所流に運ばれる。
+    float bank = smoothstep(0.16, 0.83, cloud);
+    float phase = RibbonPhase(q) + 1.4 * (broad - 0.5);
+    float ribbon = smoothstep(-0.57, 0.76, cos(phase));
+    float top = lerp(0.52, 0.76, bank) + 0.11 * (ribbon - 0.5);
+    float height = saturate(UV(p).y);
+    float layer = 1.0 - smoothstep(top - 0.22, top + 0.09, height);
+    return (0.23 + 0.31 * bank + (0.24 + 0.22 * bank) * ribbon) * lerp(1.0, layer, _HeightFalloff);
+}
+
+// 霧の出発層を示す連続座標。流入時だけ、この傾いた面を新しい空気に割り当てる。
+// RGB の面速度と同居する w はセル中心のスカラー。水平面の流れでも折れ目が残る。
+float IncomingLayer(float3 p)
+{
+    float2 q = (p.xz - _Wind.xz * _SimTime) * max(0.15, 10.0 * _NoiseFrequency);
+    return saturate(UV(p).y + 0.095 * sin(1.12 * q.x - 0.72 * q.y) +
+                    0.045 * sin(0.36 * q.x + 1.58 * q.y + 1.85));
+}
+
+float InletRate(int3 i)
+{
+    float2 cells = float2(i.x, i.z) + 0.5;
+    float2 fromEdge = float2(_Wind.x >= 0 ? cells.x : _GridSize.x - cells.x,
+                             _Wind.z >= 0 ? cells.y : _GridSize.z - cells.y);
+    float2 inlet = saturate(1.0 - fromEdge / 3.0) * saturate(abs(_Wind.xz) * 3.0);
+    return 1.4 * max(inlet.x, inlet.y);
+}
+
+// 波数と振幅の向きが直交する進行波を重ね、風に発散を作らず渦を与える。
+float3 BackgroundVelocity(float3 p)
+{
+    float3 q = (p - 0.42 * _Wind * _SimTime) * max(0.22, 9.0 * _NoiseFrequency);
+    float a = sin(dot(q, float3(0.80, 0.37, 0.60)) + 0.23 * _SimTime);
+    float b = sin(dot(q, float3(-0.52, 1.16, 0.39)) - 0.31 * _SimTime + 1.7);
+    float c = sin(dot(q, float3(1.32, 0.67, -1.13)) + 0.19 * _SimTime + 3.2);
+    float3 eddies = a * float3(0.60, 0, -0.80) + b * float3(0.58, 0.26, 0)
+                  + c * float3(0.226, 0, 0.264);
+    return _Wind + eddies * ((0.4 + 0.26 * length(_Wind)) * _Turbulence);
+}
+
+[numthreads(4, 4, 4)]
+void RasterizeSolids(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    float3 p = Center(i);
+    float mask = 0;
+    [loop] for (int n = 0; n < _BoxCount; ++n)
+    {
+        float3 q = mul(_BoxFromDomain[n], float4(p, 1)).xyz;
+        if (all(abs(q) <= 0.5))
+        {
+            mask = 1;
+            break;
+        }
+    }
+    _SolidWrite[i] = mask;
+}
+
+[numthreads(4, 4, 4)]
+void Initialize(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    float3 p = Center(i);
+    bool blocked = Solid(i);
+    _VelocityWrite[i] = blocked ? 0 : float4(BackgroundVelocity(p) * OpenFaces(i), IncomingLayer(p));
+    _DensityWrite[i] = blocked ? 0 : IncomingDensity(p);
+}
+
+[numthreads(4, 4, 4)]
+void ClearPressure(uint3 tid : SV_DispatchThreadID)
+{
+    if (Inside(int3(tid))) _PressureWrite[tid] = 0;
+}
+
+float3 VelocityAt(float3 p)
+{
+    float3 uv = UV(p);
+    float3 halfTexel = 0.5 / float3(_GridSize);
+    return float3(_VelocityRead.SampleLevel(sampler_LinearClamp, uv - float3(halfTexel.x, 0, 0), 0).x,
+                  _VelocityRead.SampleLevel(sampler_LinearClamp, uv - float3(0, halfTexel.y, 0), 0).y,
+                  _VelocityRead.SampleLevel(sampler_LinearClamp, uv - float3(0, 0, halfTexel.z), 0).z);
+}
+
+bool FluidCell(int3 i)
+{
+    return Inside(i) && !Solid(i);
+}
+
+groupshared float4 CurlTile[216]; // 4³ 個のセルと六面に一セルのハロー。辺・角は参照しない。
+
+float4 CenteredVelocity(int3 i)
+{
+    if (!FluidCell(i)) return 0;
+    // MAC 面からセル中心への補間は、隣り合う二面の算術平均と一致する。
+    float3 positive = _VelocityRead.Load(int4(i, 0)).xyz;
+    float3 negative = float3(_VelocityRead.Load(int4(max(0, i - int3(1, 0, 0)), 0)).x,
+                             _VelocityRead.Load(int4(max(0, i - int3(0, 1, 0)), 0)).y,
+                             _VelocityRead.Load(int4(max(0, i - int3(0, 0, 1)), 0)).z);
+    return float4(0.5 * (positive + negative), 1);
+}
+
+float3 TileDerivative(uint slot, uint stride, float spacing, float3 center)
+{
+    // w が 0 の隣接セルは固体または格子外。片側だけ流体なら片側差分を使う。
+    float4 lower = CurlTile[slot - stride];
+    float4 upper = CurlTile[slot + stride];
+    return (lerp(center, upper.xyz, upper.w) - lerp(center, lower.xyz, lower.w))
+           / (spacing * max(1.0, lower.w + upper.w));
+}
+
+[numthreads(4, 4, 4)]
+void Curl(uint3 tid : SV_DispatchThreadID, uint3 local : SV_GroupThreadID)
+{
+    int3 i = int3(tid);
+    uint slot = local.x + 1 + 6 * (local.y + 1 + 6 * (local.z + 1));
+    float4 center = CenteredVelocity(i);
+    CurlTile[slot] = center;
+    if (local.x == 0) CurlTile[slot - 1] = CenteredVelocity(i - int3(1, 0, 0));
+    if (local.x == 3) CurlTile[slot + 1] = CenteredVelocity(i + int3(1, 0, 0));
+    if (local.y == 0) CurlTile[slot - 6] = CenteredVelocity(i - int3(0, 1, 0));
+    if (local.y == 3) CurlTile[slot + 6] = CenteredVelocity(i + int3(0, 1, 0));
+    if (local.z == 0) CurlTile[slot - 36] = CenteredVelocity(i - int3(0, 0, 1));
+    if (local.z == 3) CurlTile[slot + 36] = CenteredVelocity(i + int3(0, 0, 1));
+    GroupMemoryBarrierWithGroupSync();
+    if (!Inside(i)) return;
+    if (center.w == 0) { _CurlWrite[i] = 0; return; }
+    float3 dx = TileDerivative(slot, 1, _CellSize.x, center.xyz);
+    float3 dy = TileDerivative(slot, 6, _CellSize.y, center.xyz);
+    float3 dz = TileDerivative(slot, 36, _CellSize.z, center.xyz);
+    float3 spin = float3(dy.z - dz.y, dz.x - dx.z, dx.y - dy.x);
+    _CurlWrite[i] = float4(spin, length(spin));
+}
+
+float SpinDerivative(int3 i, int3 axis, float spacing, float center)
+{
+    bool lower = FluidCell(i - axis);
+    bool upper = FluidCell(i + axis);
+    // 範囲外を参照する分岐が GPU 上で flatten されてもテクスチャの境界を越えない。
+    float a = lower ? _CurlRead.Load(int4(max(i - axis, 0), 0)).w : center;
+    float b = upper ? _CurlRead.Load(int4(min(i + axis, _GridSize - 1), 0)).w : center;
+    return (b - a) / (spacing * max(1.0, float(lower) + float(upper)));
+}
+
+float3 Confinement(int3 i)
+{
+    if (_Vorticity <= 0) return 0;
+    float4 spin = _CurlRead.Load(int4(i, 0));
+    float3 gradient = float3(SpinDerivative(i, int3(1, 0, 0), _CellSize.x, spin.w),
+                             SpinDerivative(i, int3(0, 1, 0), _CellSize.y, spin.w),
+                             SpinDerivative(i, int3(0, 0, 1), _CellSize.z, spin.w));
+    float3 direction = gradient * rsqrt(max(1e-8, dot(gradient, gradient)));
+    float h = min(_CellSize.x, min(_CellSize.y, _CellSize.z));
+    return (_Vorticity * h) * cross(direction, spin.xyz);
+}
+
+float3 LimitedStep(float3 delta)
+{
+    float3 cells = abs(delta / _CellSize);
+    return delta * min(1.0, 1.9 / max(1e-6, max(cells.x, max(cells.y, cells.z))));
+}
+
+// 移流線分が通るセル境界を順に調べる。終点だけの判定で生じる薄壁の飛び越しを防ぐ。
+float3 TraceThroughFluid(float3 p, float3 delta)
+{
+    if (_BoxCount == 0) return p + delta;
+    float3 gridP = p / _CellSize;
+    float3 gridDelta = delta / _CellSize;
+    int3 direction = int3(sign(gridDelta));
+    int3 cell = int3(floor(gridP + float3(direction) * 0.0001));
+    float3 nextBoundary = float3(cell) + step(0.0, gridDelta);
+    float3 spacing = rcp(max(abs(gridDelta), 1e-8));
+    float3 nextT = abs(nextBoundary - gridP) * spacing;
+    nextT = float3(direction.x == 0 ? 1e9 : nextT.x, direction.y == 0 ? 1e9 : nextT.y,
+                   direction.z == 0 ? 1e9 : nextT.z);
+    if (Solid(cell)) return p;
+    [loop] for (int n = 0; n < 32; ++n)
+    {
+        float t = min(nextT.x, min(nextT.y, nextT.z));
+        if (t >= 1.0) break;
+        int3 crossed = int3(nextT <= t + 1e-6);
+        cell += direction * crossed;
+        if (Solid(cell)) return p + delta * max(0, t - 0.002);
+        nextT += spacing * float3(crossed);
+    }
+    return p + delta;
+}
+
+float3 MidpointStep(float3 p, float dt)
+{
+    float3 middle = TraceThroughFluid(p, LimitedStep(-VelocityAt(p) * dt * 0.5));
+    return LimitedStep(-VelocityAt(middle) * dt);
+}
+
+float FluidWeight(float3 uv)
+{
+    if (_BoxCount == 0) return 1.0;
+    return max(1e-4, 1.0 - _SolidRead.SampleLevel(sampler_LinearClamp, uv, 0));
+}
+
+float CoreWeight(float3 q)
+{
+    return 1.0 - smoothstep(0.055, 0.40, dot(q, q));
+}
+
+float BowWeight(float3 q, float3 heading)
+{
+    // 動体の前面を横切ろうとする霧を集める。除去済みの中心だけを供給源にすると途中で帯が切れる。
+    float3 offset = q - 0.44 * heading;
+    float axial = dot(offset, heading);
+    return 1.0 - smoothstep(0.09, 1.0, 1.54 * dot(offset, offset) + 3.0 * axial * axial);
+}
+
+// 長い肩への移送だけ、線分対箱で遮蔽を調べる。箱をセルの半幅ぶん覆い、
+// 格子に焼いた固体と交わる経路を除外する。大きな動体でも探索量は障害物数で決まる。
+bool LongTransferBlocked(float3 p, float3 delta)
+{
+    [loop] for (int n = 0; n < _BoxCount; ++n)
+    {
+        float3 start = mul(_BoxFromDomain[n], float4(p, 1)).xyz;
+        float3 travel = mul((float3x3)_BoxFromDomain[n], delta);
+        float3 extents = 0.5 + mul(abs((float3x3)_BoxFromDomain[n]), 0.5 * _CellSize);
+        if (any((abs(travel) < 1e-7) & (abs(start) > extents))) continue;
+        float3 inverseTravel = (2.0 * step(0.0, travel) - 1.0) / max(abs(travel), 1e-10);
+        float3 lo = (-extents - start) * inverseTravel;
+        float3 hi = ( extents - start) * inverseTravel;
+        float3 enter = min(lo, hi);
+        float3 leave = max(lo, hi);
+        if (max(0.0, max(enter.x, max(enter.y, enter.z))) <= min(1.0, min(leave.x, min(leave.y, leave.z))))
+            return true;
+    }
+    return false;
+}
+
+float ShoulderTransfer(float3 p, float3 q, float radius, float3 heading, float3 side, out float3 source)
+{
+    float along = dot(q, heading);
+    float across = dot(q, side);
+    float signSide = across >= 0 ? 1.0 : -1.0;
+    float aft = 1.0 - smoothstep(-0.94, 0.15, along);
+    float shoulder = 0.47 + 0.16 * (1.0 - smoothstep(0.0, 0.85, abs(along + 0.24)));
+    float3 axis = cross(heading, side);
+    // 前面の左右半分を、それぞれ半径の 0.6〜1 倍の肩へ寄せる。軸に沿って伸ばし、
+    // 横幅と高さを絞る。逆写像のヤコビアンを掛けて、取得した流体の量を受け取り側に反映する。
+    float alongDonor = 0.44 + 0.77 * (along + 0.22);
+    float acrossDonor = (abs(across) - shoulder) / 0.57;
+    float heightDonor = (dot(q, axis) - (0.13 + 0.10 * aft)) / 0.91;
+    float3 sourceQ = alongDonor * heading + signSide * acrossDonor * side + heightDonor * axis;
+    float3 offset = (q - sourceQ) * radius;
+    source = p - offset;
+    if (!Inside(int3(floor(source / _CellSize)))) return 0;
+    float portion = (0.77 / (0.57 * 0.91)) * BowWeight(sourceQ, heading) * smoothstep(-0.18, 0.18, acrossDonor);
+    if (portion <= 0.0001 || _BoxCount == 0) return portion;
+    if (Solid(int3(floor(source / _CellSize)))) return 0;
+    if (dot(abs(offset / _CellSize), float3(1, 1, 1)) > 28.0)
+        return LongTransferBlocked(p, -offset) ? 0 : portion;
+    float3 reachable = TraceThroughFluid(p, -offset);
+    return dot(reachable - source, reachable - source) < 1e-8 ? portion : 0;
+}
+
+float3 BodyAcceleration(int3 i, float3 p, float3 velocity, inout float layer)
+{
+    float3 result = 0;
+    float bestIncoming = 0;
+    float4 donor = 0;
+    [loop] for (int n = 0; n < _ActorCount; ++n)
+    {
+        float4 sphere = _ActorPosRadius[n];
+        float3 q = (p - sphere.xyz) / max(sphere.w, 0.02);
+        if (dot(q, q) > 12.25) continue;
+        float4 actor = _ActorVelocityStrength[n];
+        // 渦芯の向きは物体と環境風との相対運動で決める。すでに巻き上がった
+        // セルの速度を基準にすると、隣り合うセルの渦軸が逆を向き、帯が分裂する。
+        float3 relative = actor.xyz - _Wind;
+        float speed = length(relative);
+        float3 heading = relative / max(1e-6, speed);
+        float along = dot(q, heading);
+        float3 lateral = q - heading * along;
+        float body = exp2(-3.4 * dot(q, q));
+        float trail = (1.0 - smoothstep(0.1, 2.9, -along)) * (1.0 - smoothstep(-0.25, 0.40, along));
+        trail *= exp2(-2.1 * dot(lateral, lateral));
+        float3 side = cross(float3(0, 1, 0), heading);
+        float side2 = dot(side, side);
+        float horizontal = smoothstep(0.006, 0.07, side2);
+        side *= rsqrt(max(1e-6, side2));
+        float3 axis = cross(heading, side);
+        float across = dot(q, side);
+        // 進行方向に対して左右の肩が外へ回り、後縁で中心に巻き戻る垂直軸の渦対。
+        // 半径内だけを加速し、離脱後の位置・向き・寿命は格子で解く。
+        float2 plane = float2(along + 0.53, across);
+        float2 toLeft = plane + float2(0, 0.67);
+        float2 toRight = plane - float2(0, 0.67);
+        float left = exp2(-3.8 * dot(toLeft, toLeft));
+        float right = exp2(-3.8 * dot(toRight, toRight));
+        float2 radial = right * toRight - left * toLeft;
+        float3 planarRoll = horizontal * (radial.x * side - radial.y * heading);
+        float height = dot(q, axis);
+        float stretch = exp2(-2.0 * height * height);
+        float4 shedding = _ActorShedding[n];
+        // 両肩の定常な巻き戻しを残し、後縁だけ片側ずつ循環を与える。楕円内の接線力は
+        // 中心を押し流さず、縁で滑らかに消える。格子上の密度と細部変位はこの流れで巻き込まれる。
+        float3 circulation = 12.0 * stretch * (1.0 - 0.30 * shedding.w * smoothstep(0.52, 1.2, -along)) * planarRoll;
+        if (shedding.z != 0.0 && along > -2.02 && along < 0.09 && abs(across) < 1.43)
+        {
+            float2 offset = float2(along, across) - shedding.xy;
+            float2 gradient = offset * float2(1.78, 1.94);
+            float envelope = saturate(1.0 - dot(offset, gradient) - 0.96 * height * height);
+            circulation += (17.0 * horizontal * shedding.z * envelope * envelope) * (gradient.x * side - gradient.y * heading);
+        }
+        float crossingRate = min(speed / max(sphere.w, 0.02), 0.7 / _Dt);
+        float3 roll = horizontal * cross(heading, lateral) * clamp(2.4 * across, -1.0, 1.0);
+        result += actor.w * ((actor.xyz - velocity) * (4.0 * body + 1.15 * trail) +
+                  speed * (lateral * (2.0 * body) + roll * (2.4 * trail) +
+                           crossingRate * circulation));
+        if (abs(across) < 1.16 && along > -0.88 && along < 0.42 && horizontal > 0 && speed > 0.01)
+        {
+            float3 source;
+            float portion = ShoulderTransfer(p, q, sphere.w, heading, side, source);
+            if (portion > 0.0001)
+            {
+                // 肩に届いた霧は元の層も引き継ぐ。供給元が空なら受け取り側の層を変更しない。
+                float3 sourceUV = UV(source);
+                float weight = FluidWeight(sourceUV);
+                float cargo = saturate(_DensityRead.SampleLevel(sampler_LinearClamp, sourceUV, 0) / weight);
+                float incoming = horizontal * (1.0 - exp(-8.5 * crossingRate * actor.w * _Dt)) * portion * cargo;
+                if (incoming > bestIncoming)
+                {
+                    bestIncoming = incoming;
+                    donor = float4(sourceUV, weight);
+                }
+            }
+        }
+    }
+    if (bestIncoming > 0)
+    {
+        float current = _DensityRead.Load(int4(i, 0));
+        float sourceLayer = _VelocityRead.SampleLevel(sampler_LinearClamp, donor.xyz, 0).w / donor.w;
+        layer = lerp(layer, saturate(sourceLayer), bestIncoming / max(0.0001, current + bestIncoming));
+    }
+    return result;
+}
+
+// 交互に剥離する渦の芯に接線力を与える。各 MAC 面の中心で円筒の支持関数を評価する。
+// 軸と同じ向きに生じる端の減衰は半径一個分に限り、柱の根元から先端まで連続させる。
+float3 WakeAcceleration(float3 p, uint mask)
+{
+    float3 result = 0;
+    [loop] while (mask != 0)
+    {
+        uint n = firstbitlow(mask);
+        mask &= mask - 1u;
+        float radiusInverse = _WakeCenters[n].w;
+        float3 axis = _WakeAxes[n].xyz;
+        float3 offset = (p - _WakeCenters[n].xyz) * radiusInverse;
+        float axial = dot(offset, axis);
+        float3 radial = offset - axial * axis;
+        float3 face = 0.5 * _CellSize * radiusInverse;
+        float3 radiusSq = dot(radial, radial) + 2.0 * face * radial + face * face * (1.0 - axis * axis);
+        float3 envelope = saturate(1.0 - radiusSq);
+        float3 cap = saturate(_WakeAxes[n].w - abs(axial + face * axis));
+        result += (_WakeBounds[n].w * cross(axis, radial)) * envelope * envelope * cap;
+    }
+    return result;
+}
+
+float4 FirstOrderVelocity(float3 p, float3 delta)
+{
+    float4 value = 0;
+    if (_BoxCount == 0) value = _VelocityRead.SampleLevel(sampler_LinearClamp, UV(p + delta), 0);
+    else
+    {
+        // 三つの面は位置が違う。障害物がある場合は面ごとに移流線分を切る。
+        float3 dx = float3(_CellSize.x * 0.5, 0, 0);
+        float3 dy = float3(0, _CellSize.y * 0.5, 0);
+        float3 dz = float3(0, 0, _CellSize.z * 0.5);
+        value.x = _VelocityRead.SampleLevel(sampler_LinearClamp, UV(TraceThroughFluid(p + dx, delta) - dx), 0).x;
+        value.y = _VelocityRead.SampleLevel(sampler_LinearClamp, UV(TraceThroughFluid(p + dy, delta) - dy), 0).y;
+        value.z = _VelocityRead.SampleLevel(sampler_LinearClamp, UV(TraceThroughFluid(p + dz, delta) - dz), 0).z;
+        float3 uv = UV(TraceThroughFluid(p, delta));
+        value.w = saturate(_VelocityRead.SampleLevel(sampler_LinearClamp, uv, 0).w / FluidWeight(uv));
+    }
+    return value;
+}
+
+[numthreads(4, 4, 4)]
+void PredictVelocity(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _VelocityWrite[i] = 0; return; }
+    float3 p = Center(i);
+    float4 value = FirstOrderVelocity(p, MidpointStep(p, _Dt));
+    _VelocityWrite[i] = float4(value.xyz * OpenFaces(i), value.w);
+}
+
+bool VelocityStencilOpen(int3 lo)
+{
+    if (any(lo < 1) || any(lo + 2 >= _GridSize)) return false;
+    if (_BoxCount == 0) return true;
+    // 2³ 個のセルとそこから出る三方向の面を調べる。八点の中央の線形サンプルは占有率になる。
+    float3 invSize = rcp(float3(_GridSize));
+    float3 uv = (float3(lo) + 1.0) * invSize;
+    return _SolidRead.SampleLevel(sampler_LinearClamp, uv, 0) == 0 &&
+           _SolidRead.SampleLevel(sampler_LinearClamp, uv + float3(invSize.x, 0, 0), 0) == 0 &&
+           _SolidRead.SampleLevel(sampler_LinearClamp, uv + float3(0, invSize.y, 0), 0) == 0 &&
+           _SolidRead.SampleLevel(sampler_LinearClamp, uv + float3(0, 0, invSize.z), 0) == 0;
+}
+
+// 順方向の一次予測を逆輸送し、往復の誤差の半分を戻す。圧力・外力は補正の後に一度だけ加える。
+float4 LimitedVelocity(int3 i, float3 p, float3 delta)
+{
+    float4 predicted = _VelocityPrediction.Load(int4(i, 0));
+    int3 lo = int3(floor((p + delta) / _CellSize - 0.5));
+    if (!VelocityStencilOpen(lo)) return predicted;
+    float3 back = MidpointStep(p, -_Dt);
+    int3 reverseLo = int3(floor((p + back) / _CellSize - 0.5));
+    if (!VelocityStencilOpen(reverseLo)) return predicted;
+    // 細い壁をまたぐ特性線では往復が成り立たない。遮蔽に沿って切り詰めた一次予測を使う。
+    if (_BoxCount > 0 && (any(abs(TraceThroughFluid(p, delta) - (p + delta)) > 1e-5 * _CellSize) ||
+                          any(abs(TraceThroughFluid(p, back) - (p + back)) > 1e-5 * _CellSize))) return predicted;
+    float4 reverse = _VelocityPrediction.SampleLevel(sampler_LinearClamp, UV(p + back), 0);
+    float4 corrected = predicted + 0.5 * (_VelocityRead.Load(int4(i, 0)) - reverse);
+    float4 low = _VelocityRead.Load(int4(lo, 0));
+    float4 high = low;
+    [unroll] for (int n = 1; n < 8; ++n)
+    {
+        float4 value = _VelocityRead.Load(int4(lo + int3(n & 1, (n >> 1) & 1, n >> 2), 0));
+        low = min(low, value);
+        high = max(high, value);
+    }
+    return clamp(corrected, low, high);
+}
+
+[numthreads(4, 4, 4)]
+void AdvectVelocity(uint3 tid : SV_DispatchThreadID, uint3 group : SV_GroupID, uint lane : SV_GroupIndex)
+{
+    // 近隣の発生器を一グループに一度だけ選ぶ。同期の前に固体・範囲外セルを終了させない。
+    if (_WakeCount > 0)
+    {
+        if (lane == 0)
+        {
+            uint mask = 0;
+            float3 center = (float3(group * 4u) + 2.0) * _CellSize;
+            [loop] for (int n = 0; n < _WakeCount; ++n)
+            {
+                if (all(abs(center - _WakeCenters[n].xyz) <= _WakeBounds[n].xyz + 2.0 * _CellSize))
+                    mask |= 1u << n;
+            }
+            WakeMask = mask;
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _VelocityWrite[i] = 0; return; }
+    float3 p = Center(i);
+    float3 delta = MidpointStep(p, _Dt);
+    float4 advected;
+    [branch] if (_HighAdvection != 0) advected = LimitedVelocity(i, p, delta);
+    else advected = FirstOrderVelocity(p, delta);
+    float3 velocity = advected.xyz;
+    float layer = advected.w;
+    // 内部では長く移流し、供給境界では入ってきた層座標に合わせる。
+    float renewal = InletRate(i) + 0.15 * max(0, _Recovery);
+    layer = lerp(layer, IncomingLayer(p), 1.0 - exp(-renewal * _Dt));
+    float3 acceleration = BodyAcceleration(i, p, velocity, layer) + Confinement(i);
+    if (_WakeCount > 0) acceleration += WakeAcceleration(p, WakeMask);
+    velocity = lerp(velocity, BackgroundVelocity(p), 1.0 - exp(-0.55 * _Dt));
+    velocity += acceleration * _Dt;
+    _VelocityWrite[i] = float4(velocity * OpenFaces(i), layer);
+}
+
+float3 DiffusionNeighbor(int3 j, int axis, float3 center)
+{
+    float3 value = center;
+    if (Inside(j) && !Solid(j)) value = _VelocityRead.Load(int4(clamp(j, 0, _GridSize - 1), 0)).xyz;
+    // 箱・床では法線速度ゼロ、接線は自由滑り。開放端の拡散フラックスはゼロ。
+    else if (Inside(j) || j.y < 0) value[axis] = 0;
+    return value;
+}
+
+[numthreads(4, 4, 4)]
+void DiffuseVelocity(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _VelocityWrite[i] = 0; return; }
+    float4 current = _VelocityRead.Load(int4(i, 0));
+    float3 velocity = current.xyz;
+    [unroll] for (int a = 0; a < 3; ++a)
+    {
+        int3 direction = int3(a == 0, a == 1, a == 2);
+        velocity += _DiffusionWeights[a] * (DiffusionNeighbor(i - direction, a, current.xyz) +
+                    DiffusionNeighbor(i + direction, a, current.xyz) - 2.0 * current.xyz);
+    }
+    _VelocityWrite[i] = float4(velocity * OpenFaces(i), current.w);
+}
+
+[numthreads(4, 4, 4)]
+void Divergence(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _DivergenceWrite[i] = 0; return; }
+    float3 positive = _VelocityRead.Load(int4(i, 0)).xyz * OpenFaces(i);
+    // X/Z の負端は指定風速、底面は不透過。正端は大気圧境界として射影する。
+    float3 negative = float3(_Wind.x, 0, _Wind.z);
+    if (i.x > 0) negative.x = Solid(i - int3(1, 0, 0)) ? 0 : _VelocityRead.Load(int4(i - int3(1, 0, 0), 0)).x;
+    if (i.y > 0) negative.y = Solid(i - int3(0, 1, 0)) ? 0 : _VelocityRead.Load(int4(i - int3(0, 1, 0), 0)).y;
+    if (i.z > 0) negative.z = Solid(i - int3(0, 0, 1)) ? 0 : _VelocityRead.Load(int4(i - int3(0, 0, 1), 0)).z;
+    _DivergenceWrite[i] = dot(positive - negative, rcp(_CellSize));
+}
+
+void PressureNeighbor(int3 j, float scale, bool positiveFace, inout float sum, inout float diagonal)
+{
+    if (!Inside(j))
+    {
+        if (positiveFace) diagonal += scale;
+        return;
+    }
+    if (Solid(j)) return;
+    diagonal += scale;
+    sum += scale * _PressureRead.Load(int4(j, 0));
+}
+
+void PressureStencil(int3 i, out float sum, out float diagonal)
+{
+    float3 scale = rcp(_CellSize * _CellSize);
+    sum = 0;
+    diagonal = 0;
+    PressureNeighbor(i - int3(1, 0, 0), scale.x, false, sum, diagonal);
+    PressureNeighbor(i + int3(1, 0, 0), scale.x, true, sum, diagonal);
+    PressureNeighbor(i - int3(0, 1, 0), scale.y, false, sum, diagonal);
+    PressureNeighbor(i + int3(0, 1, 0), scale.y, true, sum, diagonal);
+    PressureNeighbor(i - int3(0, 0, 1), scale.z, false, sum, diagonal);
+    PressureNeighbor(i + int3(0, 0, 1), scale.z, true, sum, diagonal);
+}
+
+[numthreads(4, 4, 4)]
+void Jacobi(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _PressureWrite[i] = 0; return; }
+    float sum, diagonal;
+    PressureStencil(i, sum, diagonal);
+    float rhs = _DivergenceRead.Load(int4(i, 0));
+    float center = _PressureRead.Load(int4(i, 0));
+    // 二格子法では長波長の誤差を粗格子が扱う。緩和ヤコビで格子間隔の振動を減衰する。
+    _PressureWrite[i] = diagonal > 0 ? lerp(center, (sum - rhs) / diagonal, 0.78) : 0;
+}
+
+[numthreads(4, 4, 4)]
+void RestrictPressure(uint3 tid : SV_DispatchThreadID)
+{
+    int3 coarse = int3(tid);
+    if (any(coarse >= (_GridSize >> 1))) return;
+    float residual = 0;
+    float3 area = 0;
+    // 二倍の粗セルは細セル八個分。残差は全体積で平均し、粗面の伝達率は
+    // 遮蔽されていない細面四枚の面積比で求める。固体を横切る面はゼロになる。
+    [loop] for (int n = 0; n < 8; ++n)
+    {
+        int3 child = int3(n & 1, (n >> 1) & 1, n >> 2);
+        int3 i = 2 * coarse + child;
+        if (Solid(i)) continue;
+        float sum, diagonal;
+        PressureStencil(i, sum, diagonal);
+        residual += _DivergenceRead.Load(int4(i, 0)) - (sum - diagonal * _PressureRead.Load(int4(i, 0)));
+        area += float3(child) * OpenFaces(i);
+    }
+    _CoarseStencilWrite[coarse] = float4(area * 0.25, residual * 0.125);
+    _CoarsePressureWrite[coarse] = 0;
+}
+
+[numthreads(4, 4, 4)]
+void SolveCoarse(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    int3 size = _GridSize >> 1;
+    if (any(i >= size)) return;
+    float4 stencil = _CoarseStencilRead.Load(int4(i, 0));
+    float3 scale = 0.25 / (_CellSize * _CellSize);
+    float sum = 0;
+    float diagonal = 0;
+    [unroll] for (int a = 0; a < 3; ++a)
+    {
+        int3 direction = int3(a == 0, a == 1, a == 2);
+        float plus = stencil[a] * scale[a];
+        diagonal += plus;
+        if (i[a] + 1 < size[a])
+            sum += plus * _CoarsePressureRead.Load(int4(i + direction, 0));
+        if (i[a] > 0)
+        {
+            int3 previous = i - direction;
+            float minus = _CoarseStencilRead.Load(int4(previous, 0))[a] * scale[a];
+            diagonal += minus;
+            sum += minus * _CoarsePressureRead.Load(int4(previous, 0));
+        }
+    }
+    float center = _CoarsePressureRead.Load(int4(i, 0));
+    _CoarsePressureWrite[i] = diagonal > 0 ? lerp(center, (sum - stencil.w) / diagonal, 0.9) : 0;
+}
+
+[numthreads(4, 4, 4)]
+void ProlongatePressure(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _PressureWrite[i] = 0; return; }
+    float3 uv = (float3(i) + 0.5) / float3(_GridSize);
+    float correction = _CoarsePressureRead.SampleLevel(sampler_LinearClamp, uv, 0);
+    // 正端は補正圧ゼロのゴーストセル。Clamp サンプラーの端の複製分を差し引く。
+    float3 exterior = float3(i == _GridSize - 1);
+    float3 weight = 1.0 - 0.25 * exterior;
+    _PressureWrite[i] = _PressureRead.Load(int4(i, 0)) + correction * weight.x * weight.y * weight.z;
+}
+
+float PressureAtPositiveFace(int3 j, float center)
+{
+    if (!Inside(j)) return 0;
+    return Solid(j) ? center : _PressureRead.Load(int4(j, 0));
+}
+
+[numthreads(4, 4, 4)]
+void Project(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _VelocityWrite[i] = 0; return; }
+    float pressure = _PressureRead.Load(int4(i, 0));
+    float3 adjacent = float3(PressureAtPositiveFace(i + int3(1, 0, 0), pressure),
+                             PressureAtPositiveFace(i + int3(0, 1, 0), pressure),
+                             PressureAtPositiveFace(i + int3(0, 0, 1), pressure));
+    float4 transported = _VelocityRead.Load(int4(i, 0));
+    float3 velocity = transported.xyz - (adjacent - pressure) / _CellSize;
+    _VelocityWrite[i] = float4(velocity * OpenFaces(i), transported.w);
+}
+
+// High の細部座標。背景風に対する変位を m で運び、変位の蓄積による長時間の伸長を抑える。
+[numthreads(4, 4, 4)]
+void TransportDisplacement(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _DisplacementWrite[i] = 0; return; }
+    float3 p = Center(i);
+    float3 delta = MidpointStep(p, _Dt);
+    float3 source = TraceThroughFluid(p, delta);
+    float3 uv = UV(source);
+    if (any(uv <= 0.0) || any(uv >= 1.0))
+    {
+        _DisplacementWrite[i] = float4(0, 0, 0, IncomingRibbon(source, _SimTime - _Dt));
+        return;
+    }
+
+    // 一様風では CFL 制限に達しても変位を作らない。壁で止まった分だけ実移動量を補正する。
+    float3 deviation = LimitedStep(-_Wind * _Dt) - delta + (p + delta - source);
+    float ribbon;
+    [branch] if (_DisplacementHasHistory != 0)
+    {
+        float4 upstream = _DisplacementRead.SampleLevel(sampler_LinearClamp, uv, 0) / FluidWeight(uv);
+        deviation += exp(-_Dt) * upstream.xyz;
+        ribbon = saturate(upstream.w);
+        // 一刻みの風が半セル以下でも流入を届ける。Clamp で複製された端の重みだけを外気に戻す。
+        float3 support = saturate(min(uv, 1.0 - uv) * float3(_GridSize) + 0.5);
+        float interior = support.x * support.y * support.z;
+        [branch] if (interior < 1.0)
+        {
+            deviation *= interior;
+            ribbon = lerp(IncomingRibbon(source, _SimTime - _Dt), ribbon, interior);
+        }
+    }
+    else ribbon = IncomingRibbon(source, _SimTime - _Dt);
+    deviation *= min(1.0, 1.1 * rsqrt(max(dot(deviation, deviation), 1e-8)));
+    _DisplacementWrite[i] = float4(deviation, ribbon);
+}
+
+[numthreads(4, 4, 4)]
+void PredictDensity(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _DensityWrite[i] = 0; return; }
+    float3 p = Center(i);
+    float3 donor = UV(TraceThroughFluid(p, MidpointStep(p, _Dt)));
+    _DensityWrite[i] = saturate(_DensityRead.SampleLevel(sampler_LinearClamp, donor, 0) / FluidWeight(donor));
+}
+
+float DisplaceFog(float3 p, float density)
+{
+    float removed = 0;
+    float plume = 0;
+    [loop] for (int n = 0; n < _ActorCount; ++n)
+    {
+        float4 sphere = _ActorPosRadius[n];
+        float3 q = (p - sphere.xyz) / max(sphere.w, 0.02);
+        if (dot(q, q) > 6.25) continue;
+        float4 actor = _ActorVelocityStrength[n];
+        float3 relative = actor.xyz - _Wind;
+        float speed = length(relative);
+        float crossingRate = min(speed / max(sphere.w, 0.02), 0.7 / _Dt);
+        float core = CoreWeight(q);
+        removed = max(removed, core * (1.0 - exp(-(7.5 + 4.5 * crossingRate) * _Dt * actor.w)));
+
+        float3 heading = relative / max(1e-6, speed);
+        float3 side = cross(float3(0, 1, 0), heading);
+        float side2 = dot(side, side);
+        float horizontal = smoothstep(0.006, 0.07, side2);
+        float displaced = horizontal * (1.0 - exp(-8.5 * crossingRate * _Dt * actor.w));
+        if (displaced < 0.0001) continue;
+        side *= rsqrt(max(1e-6, side2));
+        removed = max(removed, displaced * BowWeight(q, heading));
+        float3 source;
+        float portion = ShoulderTransfer(p, q, sphere.w, heading, side, source);
+        if (portion <= 0.0001) continue;
+        float3 uv = UV(source);
+        float cargo = saturate(_PredictedRead.SampleLevel(sampler_LinearClamp, uv, 0) / FluidWeight(uv));
+        plume = max(plume, cargo * displaced * portion);
+    }
+    return saturate(density * (1.0 - removed) + plume);
+}
+
+[numthreads(4, 4, 4)]
+void CorrectDensity(uint3 tid : SV_DispatchThreadID)
+{
+    int3 i = int3(tid);
+    if (!Inside(i)) return;
+    if (Solid(i)) { _DensityWrite[i] = 0; return; }
+    float3 p = Center(i);
+    float3 donor = TraceThroughFluid(p, MidpointStep(p, _Dt));
+    float3 reverseUV = UV(TraceThroughFluid(p, MidpointStep(p, -_Dt)));
+    float predicted = _PredictedRead.Load(int4(i, 0));
+    float reverse = _PredictedRead.SampleLevel(sampler_LinearClamp, reverseUV, 0) / FluidWeight(reverseUV);
+    float corrected = predicted + 0.5 * (_DensityRead.Load(int4(i, 0)) - reverse);
+    int3 lo = int3(floor(donor / _CellSize - 0.5));
+    float low = 1, high = 0;
+    [unroll] for (int n = 0; n < 8; ++n)
+    {
+        int3 j = clamp(lo + int3(n & 1, (n >> 1) & 1, n >> 2), 0, _GridSize - 1);
+        float d = _DensityRead.Load(int4(j, 0));
+        low = min(low, d);
+        high = max(high, d);
+    }
+    float density = clamp(corrected, low, high);
+    // 内部では密度を数秒間保持し、側面の流入域では新しい霧を補給する。
+    float feed = max(0, _Recovery) + InletRate(i);
+    density = lerp(density, IncomingDensity(p), 1.0 - exp(-feed * _Dt));
+    _DensityWrite[i] = DisplaceFog(p, density);
+}

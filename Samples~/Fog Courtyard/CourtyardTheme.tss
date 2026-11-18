@@ -1,0 +1,56 @@
+@import url("unity-theme://default");
+
+#courtyard-screen {
+    flex-grow: 1;
+}
+
+#controls {
+    position: absolute;
+    bottom: 18px;
+    left: 18px;
+    padding: 10px 14px 12px;
+    border-left-width: 3px;
+    border-left-color: rgb(213, 154, 87);
+    background-color: rgba(12, 22, 28, 0.93);
+}
+
+#courtyard-title {
+    color: rgb(232, 238, 229);
+    font-size: 19px;
+    -unity-font-style: bold;
+}
+
+#courtyard-hint {
+    color: rgb(186, 203, 202);
+    font-size: 13px;
+    margin-top: 2px;
+    margin-bottom: 8px;
+}
+
+#courtyard-actions {
+    flex-direction: row;
+}
+
+.courtyard-button {
+    height: 27px;
+    padding: 0 9px;
+    margin: 0 6px 0 0;
+    border-width: 0;
+    border-radius: 3px;
+    background-color: rgb(40, 60, 66);
+    background-image: none;
+    color: rgb(226, 235, 231);
+    font-size: 12px;
+    -unity-font-style: bold;
+}
+
+.courtyard-button:hover, .courtyard-button:focus {
+    background-color: rgb(61, 83, 86);
+}
+
+#show-controls {
+    position: absolute;
+    left: 18px;
+    bottom: 18px;
+    display: none;
+}

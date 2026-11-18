@@ -1,0 +1,31 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: 35d430cd54e0701458bda4704c95f41b, type: 3}
+  m_Name: GroundMist
+  m_EditorClassIdentifier: DriftFog.Runtime::DriftFog.FogProfile
+  _tint: {r: 0.65, g: 0.78, b: 0.98, a: 1}
+  _shade: {r: 0.13, g: 0.21, b: 0.36, a: 1}
+  _density: 1.6
+  _wind: {x: 0, y: 0, z: 0}
+  _noiseFrequency: 0.072
+  _turbulence: 0.62
+  _heightFalloff: 0.95
+  _edgeSoftness: 0.09
+  _simulateFluid: 1
+  _vorticity: 1.9
+  _wakeShedding: 1
+  _kinematicViscosity: 0.016
+  _highGridResolution: 128
+  _recovery: 0.16
+  _simulationRate: 30
+  _quality: 48
+  _maxDistance: 100

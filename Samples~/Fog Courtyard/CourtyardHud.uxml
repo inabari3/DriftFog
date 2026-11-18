@@ -1,0 +1,17 @@
+<ui:UXML xmlns:ui="UnityEngine.UIElements">
+    <ui:VisualElement name="courtyard-screen" focusable="true">
+        <ui:VisualElement name="controls">
+            <ui:Label name="courtyard-title" text="Fog courtyard" />
+            <ui:Label name="courtyard-hint" text="Click or tap the ground to guide the lantern." />
+            <ui:VisualElement name="courtyard-actions">
+                <ui:Button name="route" class="courtyard-button" text="Pause route" />
+                <ui:Button name="quality" class="courtyard-button" text="Quality: balanced" />
+                <ui:Button name="simulation" class="courtyard-button" text="Flow: simulated" />
+                <ui:Button name="wind" class="courtyard-button" text="Wind: courtyard" />
+                <ui:Button name="camera-view" class="courtyard-button" text="View: follow" />
+                <ui:Button name="hide-controls" class="courtyard-button" text="Hide (H)" />
+            </ui:VisualElement>
+        </ui:VisualElement>
+        <ui:Button name="show-controls" class="courtyard-button" text="Controls (H)" />
+    </ui:VisualElement>
+</ui:UXML>
