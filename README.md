@@ -4,17 +4,15 @@
 
 ## 導入
 
-1. DriftFog の GitHub ページで **Code → HTTPS** の URL をコピーし、末尾に `#v1.2.0-preview.3` を付けます。Unity の **Window → Package Management → Package Manager → ＋ → Install package from git URL…** に貼り付けます。Git URL からの導入には Git が必要です。
+1. Unity の **Window → Package Management → Package Manager → ＋ → Install package from git URL…** に、下記の URL を貼り付けます。Git URL からの導入には Git が必要です。
 2. 使用中の URP Asset で **Depth Texture** を有効にします。対象は 3D の Universal Renderer です。カメラ側で深度テクスチャを上書きする場合も有効にしてください。Renderer の **Depth Texture Mode** は **After Opaques** または **Force Prepass** を選びます。
 3. Package Manager の **Drift Fog → Samples → Fog Courtyard → Import** でサンプルを追加し、インポート先の **FogCourtyard** シーンを開いて再生します。
 
-URL の書式は次のとおりです。`OWNER/REPOSITORY` の部分に公開先の所有者名とリポジトリ名が入ります。
-
 ```text
-https://github.com/OWNER/REPOSITORY.git#v1.2.0-preview.3
+https://github.com/inabari3/DriftFog.git#v1.2.0-preview.4
 ```
 
-配布リポジトリを手元に展開済みなら、**Install package from disk…** でルートの `package.json` を選んでも導入できます。対応環境は Unity 6000.3 / URP 17.3 の 3D プロジェクトです。
+手元の `.tgz` は Package Manager の **＋ → Install package from tarball…** から選べます。配布リポジトリを展開済みなら、**Install package from disk…** でルートの `package.json` を選びます。対応環境は Unity 6000.3 / URP 17.3 の 3D プロジェクトです。
 
 中庭ではランタンが自動で霧を横切ります。初期視点はランタンを斜め上から追尾し、脇へ押し出された霧が後ろへ折り返す様子を観察できます。**View** で中庭全体に切り替え、地面をクリックすると、ランタンがそこへ移動します。左下の **Flow** で流体と解析表現、**Quality** で品質を切り替えます。**H** で操作パネルを隠せます。照明は Linear 色空間で調整しています。
 

@@ -42,6 +42,7 @@ Shader "Drift Fog/Local Volume"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/RealtimeLights.hlsl"
+            #include "DriftFogDensity.hlsl"
 
             TEXTURE3D(_FogNoise);
             SAMPLER(sampler_FogNoise);
@@ -265,7 +266,7 @@ Shader "Drift Fog/Local Volume"
                 return smoothstep(0, max(0.002, _FogShape.w), distance);
             }
 
-            // 流体を使わない場合の密度。二つの空間尺度で霧の上面と内部の筋を別々に作る。
+            // 流体を使わない場合も、風に乗った二つの空間尺度で塊の厚みを変える。
             float AnalyticConcentration(float3 position, float height)
             {
                 float turbulence = _FogShape.z;
@@ -277,10 +278,7 @@ Shader "Drift Fog/Local Volume"
                 curls += _FogMarch.w * turbulence * float3(0.005, -0.0025, 0.0035);
                 float filaments = SAMPLE_TEXTURE3D_LOD(_FogNoise, sampler_FogNoise, curls, 0).r;
                 float field = broad + (filaments - 0.5) * (0.16 + 0.53 * turbulence);
-                float cover = smoothstep(0.30, 0.75, field);
-                float top = 0.18 + 0.64 * cover + (filaments - 0.5) * 0.16;
-                float vertical = 1.0 - smoothstep(top - 0.17, top + 0.14, height);
-                return cover * lerp(1.0, vertical, _FogMotion.w);
+                return GroundConcentration(field, height, _FogMotion.w);
             }
 
             struct FluidDetailSampling
@@ -294,9 +292,9 @@ Shader "Drift Fog/Local Volume"
             float MaterialRibbon(float tracer, float originHeight)
             {
                 float section = tracer + 0.12 * (originHeight - 0.37);
-                float bank = smoothstep(0.68, 0.91, section);
-                float lip = 1.0 - smoothstep(0.024, 0.115, abs(section - 0.42));
-                return 0.30 + 1.98 * bank + 1.50 * lip;
+                float bank = smoothstep(0.54, 0.89, section);
+                float lip = 1.0 - smoothstep(0.025, 0.15, abs(section - 0.35));
+                return 0.51 + 1.29 * bank + 0.80 * lip;
             }
 
             // D は一秒の時定数で平滑化した背景風からの実移動。背景乱流の速度幅内では薄霞を保ち、
@@ -310,7 +308,7 @@ Shader "Drift Fog/Local Volume"
                 // 折り返し直後は履歴変位が小さいため、背景からの速度超過を短い応答分だけ先取りする。
                 float travel = length(displacement) * (1.0 + min(0.65, 0.60 * excessSpeed)) + min(0.12, 0.14 * excessSpeed);
                 float active = smoothstep(0.075 + 0.24 * quietTravel, 0.275 + 0.22 * quietTravel, travel);
-                return lerp(0.10, 1.0, active) * smoothstep(0.04, 0.20, mass);
+                return active * smoothstep(0.04, 0.20, mass);
             }
 
             float TransportedDetail(float3 uv, float3 displacement, float originHeight, float mass, float ribbonActivity, FluidDetailSampling detail)
@@ -331,40 +329,26 @@ Shader "Drift Fog/Local Volume"
                 float noise = SAMPLE_TEXTURE3D_LOD(_FogNoise, sampler_FogNoise, noiseUV, 0).r;
                 // 静かな地霧には移流する濃淡を残し、剥離した帯では主流の連続した形を優先する。
                 float variation = 2.0 * smoothstep(0.16, 0.76, noise) - 1.0;
-                float2 contrastRange = lerp(float2(0.84, 0.37), float2(0.37, 0.20), ribbonActivity);
+                float2 contrastRange = lerp(float2(0.46, 0.26), float2(0.32, 0.18), ribbonActivity);
                 float contrast = lerp(contrastRange.x, contrastRange.y, smoothstep(0.56, 0.94, mass)) * smoothstep(0.02, 0.13, mass);
                 return 1.0 + detail.amplitude * bandLimit * contrast * variation;
             }
 
-            // 視線と照明は同じ輸送密度・由来層に従う。疎に積分する照明には微細構造の空間平均を用いる。
+            // 視線と照明は同じ輸送密度を参照する。遠くの照明には微細構造の空間平均を用いる。
             float FluidExtinction(float3 local, FluidDetailSampling detail, bool resolveRibbon)
             {
                 float3 uv = local + 0.5;
                 float mass = SAMPLE_TEXTURE3D_LOD(_FogFluidDensity, sampler_FogFluidDensity, uv, 0).r;
-                float body = smoothstep(0.10, 0.80, mass);
-                float extinction = mass * (0.13 + 2.47 * body * body);
-                if (_FogMarch.x <= 12 || mass <= 0.02)
-                    return extinction;
-
-                // w は格子中心で輸送された由来層の高さ。同じ空気と動く厚い下層と薄い上層を
-                // 滑らかに濃淡へ変える。途中の谷が折り込まれると内巻きの陰が残る。
-                float4 flow = SAMPLE_TEXTURE3D_LOD(_FogFluidVelocity, sampler_FogFluidDensity, uv, 0);
-                float originHeight = flow.w;
-                float strength = smoothstep(0.02, 0.14, mass) * (_FogMarch.x < 32 ? 0.55 : 1.0);
-                [branch] if (_FogMarch.x >= 32 && _FogFluidDrift.w > 0.5 && resolveRibbon)
+                float extinction = mass * (0.38 + 1.50 * mass);
+                [branch] if (mass > 0.02 && _FogMarch.x >= 32 && _FogFluidDrift.w > 0.5 && resolveRibbon)
                 {
+                    float4 flow = SAMPLE_TEXTURE3D_LOD(_FogFluidVelocity, sampler_FogFluidDensity, uv, 0);
                     float4 field = SAMPLE_TEXTURE3D_LOD(_FogFluidDisplacement, sampler_FogFluidDensity, uv, 0);
                     float activity = RibbonActivity(field.xyz, flow.xyz, mass);
-                    extinction *= lerp(1.0, MaterialRibbon(field.w, originHeight), strength * activity);
+                    extinction *= lerp(1.0, MaterialRibbon(field.w, flow.w), activity);
                     [branch] if (detail.amplitude > 0)
-                        extinction *= TransportedDetail(uv, field.xyz, originHeight, mass, activity, detail);
-                    strength *= lerp(1.0, 0.62, activity);
+                        extinction *= TransportedDetail(uv, field.xyz, flow.w, mass, activity, detail);
                 }
-                float lower = 1.0 - smoothstep(0.0, 0.18, abs(originHeight - 0.23));
-                float upper = 1.0 - smoothstep(0.0, 0.12, abs(originHeight - 0.55));
-                float valley = 1.0 - smoothstep(0.0, 0.10, abs(originHeight - 0.41));
-                float layer = 0.80 + 0.67 * lower + 0.80 * upper - 0.28 * valley;
-                extinction *= lerp(1.0, layer, strength);
                 return extinction;
             }
 
@@ -450,14 +434,20 @@ Shader "Drift Fog/Local Volume"
                     sky = BeamTransmittance(position, local, float3(0, 1, 0), upOS, true, quadrature, weightedOrigin);
                 if (!hasSun)
                     return float2(0, sky);
-                float shadow = 1.0;
-                #if defined(MAIN_LIGHT_CALCULATE_SHADOWS)
-                    float4 coord = TransformWorldToShadowCoord(position);
-                    coord.w = 1.0; // 平行光のアトラス座標は透視除算を必要としない。
-                    shadow = lerp(MainLightRealtimeShadow(coord), 1.0, GetMainLightShadowFade(position));
-                #endif
                 float direct = BeamTransmittance(position, local, toLight, lightOS, false, quadrature, weightedOrigin);
-                return float2(direct * lerp(_FogFluidActive > 0.5 ? 0.22 : 0.48, 1.0, shadow), sky);
+                return float2(direct, sky);
+            }
+
+            // 遮蔽物の影は短い距離でも急変する。霧自身の緩やかな透過率とは別に積分する。
+            float SceneShadow(float3 position, float2 filterPhase)
+            {
+                float4 coord = TransformWorldToShadowCoord(position);
+                coord.w = 1.0;
+                // ソフトシャドウの参照位置を視線の各刻みに分散する。硬い影では幅がゼロになる。
+                ShadowSamplingData sampling = GetMainLightShadowSamplingData();
+                coord.xy += (filterPhase - 0.5) * sampling.softShadowQuality * sampling.shadowmapSize.xy;
+                float shadow = lerp(MainLightRealtimeShadow(coord), 1.0, GetMainLightShadowFade(position));
+                return lerp(_FogFluidActive > 0.5 ? 0.22 : 0.48, 1.0, shadow);
             }
 
             // 等方散乱に対する Henyey–Greenstein 位相関数の比。軟らかい前方散乱を残す。
@@ -548,8 +538,8 @@ Shader "Drift Fog/Local Volume"
                     detail.amplitude = amplitude * (1.0 - smoothstep(0.22, 0.80, stepLength));
                 }
                 // 画素単位の固定オフセットで、時間方向のちらつきを増やさず層境界を分散する。
-                float jitter = frac(52.9829189 * frac(dot(floor(input.positionCS.xy), float2(0.06711056, 0.00583715))));
-                jitter = 0.2 + jitter * 0.6;
+                float pixelPhase = frac(52.9829189 * frac(dot(floor(input.positionCS.xy), float2(0.06711056, 0.00583715))));
+                float jitter = 0.2 + pixelPhase * 0.6;
                 Light sun = GetMainLight();
                 float3 lightOS = mul((float3x3)GetWorldToObjectMatrix(), sun.direction);
                 float3 upOS = GetWorldToObjectMatrix()._m01_m11_m21;
@@ -580,7 +570,7 @@ Shader "Drift Fog/Local Volume"
                         float2 lighting = 1;
                         if (hasSun || fluid)
                         {
-                            // 空の区間は影を読まない。濃度がある区間だけ端点を取り、実際の距離で補間する。
+                            // 空の区間を飛ばし、霧の自己遮蔽を四刻みごとの端点から距離で補間する。
                             int groupStart = i - (i & 3);
                             if (i > cachedEnd)
                             {
@@ -599,6 +589,15 @@ Shader "Drift Fog/Local Volume"
                             }
                             lighting = lerp(previousLight, nextLight, saturate((distanceAlongRay - cachedStartT) * cachedInvLength));
                         }
+                        #if defined(MAIN_LIGHT_CALCULATE_SHADOWS)
+                            // 影の評価点を刻みごとにずらす。画面とカメラが静止すれば同じ値になる。
+                            if (hasSun)
+                            {
+                                float shadowT = cellStart + cellLength * frac(pixelPhase + 0.618034 * i);
+                                float2 filterPhase = frac(float2(pixelPhase, 1.0 - pixelPhase) + i * float2(0.754878, 0.569840));
+                                lighting.x *= SceneShadow(origin + direction * shadowT, filterPhase);
+                            }
+                        #endif
                         incident += sunColor * lighting.x + skylight * lighting.y;
                         if (lampMask != 0u)
                             incident += LocalRadiance(position, local, lampCount, lampMask) * _FogTint.rgb;

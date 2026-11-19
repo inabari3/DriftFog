@@ -15,6 +15,8 @@
 #pragma kernel PredictDensity
 #pragma kernel CorrectDensity
 
+#include "../../DriftFogDensity.hlsl"
+
 // 各セルの正側の三面に速度を置く MAC 格子。密度・圧力・固体マスクはセル中心。
 // 位置は体積の最小隅を原点とするメートル、速度は同じ直交座標系での m/s。
 int3 _GridSize;
@@ -95,39 +97,30 @@ float3 OpenFaces(int3 i)
     return float3(!Solid(i + int3(1, 0, 0)), !Solid(i + int3(0, 1, 0)), !Solid(i + int3(0, 0, 1)));
 }
 
-float RibbonPhase(float3 q)
-{
-    float2 stream = float2(dot(q.xz, _InflowHeading), dot(q.xz, float2(-_InflowHeading.y, _InflowHeading.x)));
-    return 40.0 * stream.y + 2.35 * sin(12.0 * stream.x + 3.0 * stream.y) +
-           1.1 * sin(5.3 * stream.x - 7.8 * stream.y + 1.6) + 2.4 * q.y;
-}
-
+// 後流で曲がったときにだけ縁を読めるよう、空気と一緒に運ぶ目印。流入密度とは独立。
 float IncomingRibbon(float3 p, float time)
 {
     float3 q = (p - _Wind * time) * _NoiseFrequency;
-    q.y *= 1.4;
-    return 0.5 + 0.5 * cos(RibbonPhase(q));
+    float2 across = float2(-_InflowHeading.y, _InflowHeading.x);
+    float3 uv = float3(dot(q.xz, _InflowHeading), 1.3 * q.y, 1.7 * dot(q.xz, across));
+    return _NoiseTex.SampleLevel(sampler_NoiseTex, uv + float3(0.43, 0.64, 0.21), 0);
 }
 
 // 外から入る側の密度には風速で移流する霧の塊を連続的に供給する。
 float IncomingDensity(float3 p)
 {
-    float3 q = (p - _Wind * _SimTime) * _NoiseFrequency;
-    q.y *= 1.4;
+    float3 advected = (p - _Wind * _SimTime) * _NoiseFrequency;
+    float2 across = float2(-_InflowHeading.y, _InflowHeading.x);
+    float3 q = float3(0.78 * dot(advected.xz, _InflowHeading), advected.y, dot(advected.xz, across));
+    // 大きな渦で塊の輪郭を曲げ、小さい渦で内部の濃淡を作る。上下にも同じ空間場が続く。
+    float warp = _NoiseTex.SampleLevel(sampler_NoiseTex, q.zxy * 0.61 + float3(0.71, 0.19, 0.53), 0);
+    q += (warp - 0.5) * (0.10 + 0.24 * _Turbulence) * float3(0.83, -0.52, 0.91);
     float broad = _NoiseTex.SampleLevel(sampler_NoiseTex, q + float3(0.13, 0.33, 0.27), 0);
-    float3 fineUV = q.zxy * 2.17 + float3(0.37, 0.51, 0.73);
-    fineUV += _Turbulence * (broad - 0.5) * float3(0.6, -0.43, 0.31);
+    float3 fineUV = q.zxy * 2.13 + float3(0.37, 0.51, 0.73);
+    fineUV += (broad - 0.5) * _Turbulence * float3(0.39, -0.23, 0.32);
     float fine = _NoiseTex.SampleLevel(sampler_NoiseTex, fineUV, 0);
-    float cloud = broad + (fine - 0.5) * (0.28 + 0.4 * _Turbulence);
-    // 上から見ても追える厚みのある曲線を流入する空気に含める。高さ方向の位相差を小さくし、
-    // 視線積分で濃淡が消えないようにする。供給後は密度の実値として局所流に運ばれる。
-    float bank = smoothstep(0.16, 0.83, cloud);
-    float phase = RibbonPhase(q) + 1.4 * (broad - 0.5);
-    float ribbon = smoothstep(-0.57, 0.76, cos(phase));
-    float top = lerp(0.52, 0.76, bank) + 0.11 * (ribbon - 0.5);
-    float height = saturate(UV(p).y);
-    float layer = 1.0 - smoothstep(top - 0.22, top + 0.09, height);
-    return (0.23 + 0.31 * bank + (0.24 + 0.22 * bank) * ribbon) * lerp(1.0, layer, _HeightFalloff);
+    float field = broad + (fine - 0.5) * (0.28 + 0.30 * _Turbulence);
+    return GroundConcentration(field, saturate(UV(p).y), _HeightFalloff);
 }
 
 // 霧の出発層を示す連続座標。流入時だけ、この傾いた面を新しい空気に割り当てる。

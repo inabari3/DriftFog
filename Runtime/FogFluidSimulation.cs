@@ -350,6 +350,7 @@ namespace DriftFog
             _compute.SetInt("_HighAdvection", _transportDisplacement >= 0 ? 1 : 0);
             if (_transportDisplacement >= 0)
             {
+                _compute.SetTexture(_transportDisplacement, "_NoiseTex", noise);
                 _predictVelocity = _compute.FindKernel("PredictVelocity");
                 _compute.SetTexture(_predictVelocity, "_SolidRead", Solids);
                 _compute.SetTexture(_predictVelocity, "_VelocityRead", Velocity);
@@ -474,7 +475,7 @@ namespace DriftFog
             _compute.SetFloat("_SimTime", _clock);
             _domainWind = _worldToDomain.MultiplyVector(profile.Wind);
             _compute.SetVector("_Wind", _domainWind);
-            // 流入する帯は横風に追従し、静穏時は既定の軸を用いる。すでに領域にある密度はそのまま運ぶ。
+            // 流入する霧の塊の長軸を風向に合わせる。静穏時は既定の軸を使い、領域内の密度はそのまま運ぶ。
             float horizontalSpeed = new Vector2(_domainWind.x, _domainWind.z).magnitude;
             float blend = Mathf.SmoothStep(0f, 1f, Mathf.InverseLerp(0.025f, 0.25f, horizontalSpeed));
             float angle = Mathf.LerpAngle(22.97f, Mathf.Atan2(_domainWind.z, _domainWind.x) * Mathf.Rad2Deg, blend) * Mathf.Deg2Rad;
