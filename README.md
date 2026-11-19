@@ -4,12 +4,12 @@
 
 ## 導入
 
-1. Unity の **Window → Package Management → Package Manager → ＋ → Install package from git URL…** に、下記の URL を貼り付けます。Git URL からの導入には Git が必要です。
+1. Unity の **Window → Package Management → Package Manager → ＋ → Install package from git URL…** に、下記の URL を貼り付けて **1.2.0-preview.5** を導入します。Git URL からの導入には Git が必要です。
 2. 使用中の URP Asset で **Depth Texture** を有効にします。対象は 3D の Universal Renderer です。カメラ側で深度テクスチャを上書きする場合も有効にしてください。Renderer の **Depth Texture Mode** は **After Opaques** または **Force Prepass** を選びます。
 3. Package Manager の **Drift Fog → Samples → Fog Courtyard → Import** でサンプルを追加し、インポート先の **FogCourtyard** シーンを開いて再生します。
 
 ```text
-https://github.com/inabari3/DriftFog.git#v1.2.0-preview.4
+https://github.com/inabari3/DriftFog.git#v1.2.0-preview.5
 ```
 
 手元の `.tgz` は Package Manager の **＋ → Install package from tarball…** から選べます。配布リポジトリを展開済みなら、**Install package from disk…** でルートの `package.json` を選びます。対応環境は Unity 6000.3 / URP 17.3 の 3D プロジェクトです。
@@ -53,11 +53,11 @@ https://github.com/inabari3/DriftFog.git#v1.2.0-preview.4
 | --- | ---: | ---: | ---: |
 | Low | 12 | 40 セル | 約 2.4 MiB |
 | Balanced | 24 | 64 セル | 約 9.9 MiB |
-| High | 48 | 88 セル（既定）～128 セル | 約 36.1～111 MiB |
+| High | 48 | 88 セル（既定）～128 セル | 約 41.2～126.8 MiB |
 
 データ量は速度・密度・圧力・作業用テクスチャの合計から算出しています。GPU ドライバーの配置・アラインメント分は別途必要です。平たい地霧では短い軸のセル数が減ります。視線が霧を短くかすめる場合は、積分歩数も減ります。
 
-High では風と局所流との移動量の差も格子に保存し、太い霧の帯と細かな濃淡を流れに沿って曲げます。中庭の地霧は 128×20×108 セルで、上表の格子を合わせて約 14.6 MiB です。追加格子を確保できない場合も密度と光の描画を継続します。
+High は速い流れや障害物の近くを拡大して見せる用途に向いています。風速の三成分をそれぞれの格子面から追跡し、一刻みで数セル動く霧もその時間分だけ運びます。圧力は三段階の格子で解き、対応 GPU では単精度を使います。中庭の地霧は 128×20×108 セルで約 16.7 MiB です。格子の割当状況に応じて半精度の圧力、二段階の圧力計算、細部変位の省略を利用します。
 
 流体には Compute Shader と書き込み可能な 3D テクスチャが必要です。非対応 GPU と **Simulate Fluid** がオフのプロファイルでは解析表現を使用します。領域ごとに計算するため、隣り合う体積は互いの速度や密度を交換しません。コライダーは格子解像度で近似されます。広い屋外では、キャラクターの近くや流れを見せたい場所に体積を絞ると、描画とシミュレーションの両方の負荷を下げられます。
 

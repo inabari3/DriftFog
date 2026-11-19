@@ -18,6 +18,9 @@ namespace DriftFog
         private const int SecondCoarsePressure = 12;
         private const int FirstDisplacement = 13;
         private const int SecondDisplacement = 14;
+        private const int QuarterStencil = 15;
+        private const int FirstQuarterPressure = 16;
+        private const int SecondQuarterPressure = 17;
         // 角柱の後流に使う代表ストローハル数。風上から見た幅で無次元化する。
         private const float BoxStrouhal = 0.13f;
         private const float ActorStrouhal = 0.21f;
@@ -28,6 +31,7 @@ namespace DriftFog
         private static readonly int WakeBounds = Shader.PropertyToID("_WakeBounds");
         private static readonly int PressureRead = Shader.PropertyToID("_PressureRead");
         private static readonly int PressureWrite = Shader.PropertyToID("_PressureWrite");
+        private static readonly int PressureColor = Shader.PropertyToID("_PressureColor");
         private static readonly int DensityRead = Shader.PropertyToID("_DensityRead");
         private static readonly int DensityWrite = Shader.PropertyToID("_DensityWrite");
         private static readonly int CoarsePressureRead = Shader.PropertyToID("_CoarsePressureRead");
@@ -35,7 +39,7 @@ namespace DriftFog
         private static readonly int DisplacementRead = Shader.PropertyToID("_DisplacementRead");
         private static readonly int DisplacementWrite = Shader.PropertyToID("_DisplacementWrite");
         private static readonly int DisplacementHasHistory = Shader.PropertyToID("_DisplacementHasHistory");
-        private readonly RenderTexture[] _textures = new RenderTexture[15];
+        private readonly RenderTexture[] _textures = new RenderTexture[18];
         private readonly FogInteractor[] _actors = new FogInteractor[ActorLimit];
         private readonly FogInteractor[] _previousActors = new FogInteractor[ActorLimit];
         private readonly Vector3[] _previousPositions = new Vector3[ActorLimit];
@@ -76,6 +80,10 @@ namespace DriftFog
         private int _jacobi;
         private int _restrictPressure;
         private int _solveCoarse;
+        private int _restrictCoarseResidual;
+        private int _prolongateCoarse;
+        private bool _hasQuarterGrid;
+        private bool _pressureReset;
         private int _prolongatePressure;
         private int _project;
         private int _transportDisplacement = -1;
@@ -332,13 +340,42 @@ namespace DriftFog
             _correct = _compute.FindKernel("CorrectDensity");
             _compute.SetInts("_GridSize", _grid.x, _grid.y, _grid.z);
             _compute.SetVector("_CellSize", CellSize);
+            bool wideScalar = quality == FogQuality.High && SupportsFormat(GraphicsFormat.R32_SFloat);
+            bool wideStencil = quality == FogQuality.High && SupportsFormat(GraphicsFormat.R32G32B32A32_SFloat);
             for (int i = 0; i < FirstDisplacement; ++i)
             {
-                GraphicsFormat format = i < 3 || i == CoarseStencil ? GraphicsFormat.R16G16B16A16_SFloat : GraphicsFormat.R16_SFloat;
+                bool stencil = i == CoarseStencil;
+                bool pressure = (i >= FirstPressure && i <= 8) || i == FirstCoarsePressure || i == SecondCoarsePressure;
+                GraphicsFormat format = i < 3 || stencil ? GraphicsFormat.R16G16B16A16_SFloat : GraphicsFormat.R16_SFloat;
                 int divisor = i >= CoarseStencil ? 2 : 1;
-                if (!CreateField(i, divisor, format))
+                if (!CreateSolverField(i, divisor, format, (pressure && wideScalar) || (stencil && wideStencil)))
                 {
                     return false;
+                }
+            }
+
+            if (quality == FogQuality.High)
+            {
+                _hasQuarterGrid = CreateSolverField(QuarterStencil, 4, GraphicsFormat.R16G16B16A16_SFloat, wideStencil)
+                    && CreateSolverField(FirstQuarterPressure, 4, GraphicsFormat.R16_SFloat, wideScalar)
+                    && CreateSolverField(SecondQuarterPressure, 4, GraphicsFormat.R16_SFloat, wideScalar);
+                if (_hasQuarterGrid)
+                {
+                    _restrictCoarseResidual = _compute.FindKernel("RestrictCoarseResidual");
+                    _prolongateCoarse = _compute.FindKernel("ProlongateCoarse");
+                    _compute.SetTexture(_restrictCoarseResidual, "_CoarseStencilRead", _textures[CoarseStencil]);
+                    _compute.SetTexture(_restrictCoarseResidual, CoarsePressureRead, _textures[FirstCoarsePressure]);
+                    _compute.SetTexture(_restrictCoarseResidual, "_CoarseStencilWrite", _textures[QuarterStencil]);
+                    _compute.SetTexture(_restrictCoarseResidual, CoarsePressureWrite, _textures[FirstQuarterPressure]);
+                    _compute.SetTexture(_prolongateCoarse, PressureRead, _textures[FirstCoarsePressure]);
+                    _compute.SetTexture(_prolongateCoarse, CoarsePressureRead, _textures[FirstQuarterPressure]);
+                    _compute.SetTexture(_prolongateCoarse, PressureWrite, _textures[SecondCoarsePressure]);
+                }
+                else
+                {
+                    ReleaseField(QuarterStencil);
+                    ReleaseField(FirstQuarterPressure);
+                    ReleaseField(SecondQuarterPressure);
                 }
             }
 
@@ -382,7 +419,6 @@ namespace DriftFog
             _compute.SetTexture(_restrictPressure, "_DivergenceRead", Divergence);
             _compute.SetTexture(_restrictPressure, "_CoarseStencilWrite", _textures[CoarseStencil]);
             _compute.SetTexture(_restrictPressure, CoarsePressureWrite, _textures[FirstCoarsePressure]);
-            _compute.SetTexture(_solveCoarse, "_CoarseStencilRead", _textures[CoarseStencil]);
             _compute.SetTexture(_prolongatePressure, PressureRead, _textures[FirstPressure]);
             _compute.SetTexture(_prolongatePressure, CoarsePressureRead, _textures[FirstCoarsePressure]);
             _compute.SetTexture(_prolongatePressure, PressureWrite, _textures[SecondPressure]);
@@ -396,6 +432,39 @@ namespace DriftFog
             _compute.SetTexture(_correct, "_VelocityRead", Velocity);
             _compute.SetTexture(_correct, "_PredictedRead", _textures[5]);
             return true;
+        }
+
+        private bool CreateSolverField(int index, int divisor, GraphicsFormat compactFormat, bool wide)
+        {
+            // High の圧力は単精度を優先する。追加のメモリを確保できない場合も同じ演算子を使う。
+            if (wide)
+            {
+                GraphicsFormat format = compactFormat == GraphicsFormat.R16_SFloat ? GraphicsFormat.R32_SFloat : GraphicsFormat.R32G32B32A32_SFloat;
+                if (TryCreateField(index, divisor, format))
+                {
+                    return true;
+                }
+            }
+
+            return TryCreateField(index, divisor, compactFormat);
+        }
+
+        private bool TryCreateField(int index, int divisor, GraphicsFormat format)
+        {
+            try
+            {
+                if (CreateField(index, divisor, format))
+                {
+                    return true;
+                }
+            }
+            catch (Exception exception) when (exception is UnityException || exception is OutOfMemoryException || exception is ArgumentException)
+            {
+                Debug.LogWarning("Drift Fog の格子を確保できませんでした。 " + exception.Message);
+            }
+
+            ReleaseField(index);
+            return false;
         }
 
         private bool CreateField(int index, int divisor, GraphicsFormat format)
@@ -457,9 +526,13 @@ namespace DriftFog
 
         private bool TexturesValid()
         {
-            int count = _transportDisplacement >= 0 ? _textures.Length : FirstDisplacement;
-            for (int i = 0; i < count; ++i)
+            for (int i = 0; i < _textures.Length; ++i)
             {
+                if ((i >= QuarterStencil && !_hasQuarterGrid) || (i >= FirstDisplacement && i < QuarterStencil && _transportDisplacement < 0))
+                {
+                    continue;
+                }
+
                 if (!_textures[i] || !_textures[i].IsCreated())
                 {
                     return false;
@@ -521,6 +594,7 @@ namespace DriftFog
                     _compute.SetMatrixArray("_BoxFromDomain", _boxes);
                 }
 
+                _pressureReset = true;
                 Dispatch(_raster);
                 // 箱の移動や再確保で境界条件が変わった場合だけ、前ステップの圧力を破棄する。
                 Dispatch(_clearPressure);
@@ -775,19 +849,14 @@ namespace DriftFog
             Dispatch(_advect);
             DiffuseMomentum();
             Dispatch(_divergence);
-            // 細かい格子で局所誤差をならし、粗い格子で低周波残差を補正する。
-            SmoothPressure(FirstPressure, 2);
-            DispatchCoarse(_restrictPressure);
-            for (int i = 0; i < _coarseIterations; ++i)
+            // 境界が変わった刻みはゼロ圧から解く。通常時は前回の解で開始する。
+            int cycles = _hasQuarterGrid ? (_pressureReset ? 4 : 2) : 1;
+            for (int i = 0; i < cycles; ++i)
             {
-                bool even = (i & 1) == 0;
-                _compute.SetTexture(_solveCoarse, CoarsePressureRead, _textures[even ? FirstCoarsePressure : SecondCoarsePressure]);
-                _compute.SetTexture(_solveCoarse, CoarsePressureWrite, _textures[even ? SecondCoarsePressure : FirstCoarsePressure]);
-                DispatchCoarse(_solveCoarse);
+                PressureCycle(i + 1 == cycles ? _postIterations : 5);
             }
 
-            Dispatch(_prolongatePressure);
-            SmoothPressure(SecondPressure, _postIterations);
+            _pressureReset = false;
             Dispatch(_project);
             if (_transportDisplacement >= 0)
             {
@@ -810,6 +879,29 @@ namespace DriftFog
             Dispatch(_correct);
         }
 
+        private void PressureCycle(int postIterations)
+        {
+            // 細かい格子で局所誤差をならし、粗い格子で低周波残差を補正する。
+            SmoothPressure(FirstPressure, 2);
+            DispatchCoarse(_restrictPressure);
+            if (_hasQuarterGrid)
+            {
+                // 偶数回の前処理と底面解は各段の先頭へ戻る。補間は別面へ加算し、奇数回で戻す。
+                SmoothCoarse(1, CoarseStencil, FirstCoarsePressure, SecondCoarsePressure, 4);
+                DispatchCoarse(_restrictCoarseResidual, 2);
+                SmoothCoarse(2, QuarterStencil, FirstQuarterPressure, SecondQuarterPressure, 24);
+                DispatchCoarse(_prolongateCoarse);
+                SmoothCoarse(1, CoarseStencil, SecondCoarsePressure, FirstCoarsePressure, 7);
+            }
+            else
+            {
+                SmoothCoarse(1, CoarseStencil, FirstCoarsePressure, SecondCoarsePressure, _coarseIterations);
+            }
+
+            Dispatch(_prolongatePressure);
+            SmoothPressure(SecondPressure, postIterations);
+        }
+
         private void SmoothPressure(int read, int iterations)
         {
             for (int i = 0; i < iterations; ++i)
@@ -822,9 +914,28 @@ namespace DriftFog
             }
         }
 
-        private void DispatchCoarse(int kernel)
+        private void SmoothCoarse(int level, int stencil, int first, int second, int iterations)
         {
-            _compute.Dispatch(kernel, (_grid.x + 7) / 8, (_grid.y + 7) / 8, (_grid.z + 7) / 8);
+            _compute.SetInt("_PressureLevel", level);
+            _compute.SetTexture(_solveCoarse, "_CoarseStencilRead", _textures[stencil]);
+            for (int i = 0; i < iterations; ++i)
+            {
+                if (level == 2)
+                {
+                    _compute.SetInt(PressureColor, i & 1);
+                }
+
+                _compute.SetTexture(_solveCoarse, CoarsePressureRead, _textures[first]);
+                _compute.SetTexture(_solveCoarse, CoarsePressureWrite, _textures[second]);
+                DispatchCoarse(_solveCoarse, level);
+                (first, second) = (second, first);
+            }
+        }
+
+        private void DispatchCoarse(int kernel, int level = 1)
+        {
+            int width = 4 << level;
+            _compute.Dispatch(kernel, (_grid.x + width - 1) / width, (_grid.y + width - 1) / width, (_grid.z + width - 1) / width);
         }
 
         private void Dispatch(int kernel)
@@ -855,6 +966,7 @@ namespace DriftFog
             _skipBoxMotion = true;
             _densityIndex = 3;
             _transportDisplacement = -1;
+            _hasQuarterGrid = false;
             _displacementIndex = FirstDisplacement;
             _hasDisplacement = false;
             _driftX = 0d;

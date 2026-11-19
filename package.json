@@ -1,7 +1,7 @@
 {
   "name": "com.driftfog.volumes",
   "displayName": "Drift Fog",
-  "version": "1.2.0-preview.4",
+  "version": "1.2.0-preview.5",
   "unity": "6000.3",
   "license": "MIT",
   "description": "Local volumetric fog for URP with GPU fluid simulation, limited MacCormack advection, adjustable kinematic viscosity, interactive wakes and volumetric lighting.",
