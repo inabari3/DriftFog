@@ -9,7 +9,7 @@ namespace DriftFog.Editor
     [CanEditMultipleObjects]
     public sealed class FogPlacement : UnityEditor.Editor
     {
-        private readonly MaterialPropertyBlock _previewState = new MaterialPropertyBlock();
+        private MaterialPropertyBlock _previewState;
 
         /// <summary>プロファイルと現在のパイプライン設定を表示する。</summary>
         public override void OnInspectorGUI()
@@ -33,6 +33,8 @@ namespace DriftFog.Editor
             FogProfile profile = volume.Profile;
             if (Application.isPlaying && volume.isActiveAndEnabled && profile)
             {
+                // Editor の構築中はネイティブ API を呼べないため、再生状態を初めて描画するときに確保する。
+                _previewState ??= new MaterialPropertyBlock();
                 volume.GetComponent<MeshRenderer>().GetPropertyBlock(_previewState);
                 RenderTexture grid = _previewState.GetTexture("_FogFluidDensity") as RenderTexture;
                 if (grid && _previewState.GetFloat("_FogFluidActive") > 0.5f)

@@ -4,12 +4,12 @@
 
 ## 導入
 
-1. Unity の **Window → Package Management → Package Manager → ＋ → Install package from git URL…** に、下記の URL を貼り付けて **1.2.0-preview.5** を導入します。Git URL からの導入には Git が必要です。
+1. Unity の **Window → Package Management → Package Manager → ＋ → Install package from git URL…** に、下記の URL を貼り付けて **1.2.0-preview.6** を導入します。Git URL からの導入には Git が必要です。
 2. 使用中の URP Asset で **Depth Texture** を有効にします。対象は 3D の Universal Renderer です。カメラ側で深度テクスチャを上書きする場合も有効にしてください。Renderer の **Depth Texture Mode** は **After Opaques** または **Force Prepass** を選びます。
 3. Package Manager の **Drift Fog → Samples → Fog Courtyard → Import** でサンプルを追加し、インポート先の **FogCourtyard** シーンを開いて再生します。
 
 ```text
-https://github.com/inabari3/DriftFog.git#v1.2.0-preview.5
+https://github.com/inabari3/DriftFog.git#v1.2.0-preview.6
 ```
 
 手元の `.tgz` は Package Manager の **＋ → Install package from tarball…** から選べます。配布リポジトリを展開済みなら、**Install package from disk…** でルートの `package.json` を選びます。対応環境は Unity 6000.3 / URP 17.3 の 3D プロジェクトです。
